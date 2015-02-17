@@ -22,11 +22,17 @@
 
 #define NUMCHARS 40
 
-/* State passed to copy routines */
+
+typedef enum
+{ ASCENDING, DESCENDING, RANDOM } order_t;
+
+char *orders[] = { "ascending", "descending", "random" };
 
 static off_t blocksize = 512;
 static off_t logicalsize = 1024 * 1024 * 1024;
 static off_t writeevery = 1024 * 1024;
+static order_t order = ASCENDING;
+static int initialtruncate = 0;
 
 void
 usage ()
@@ -41,6 +47,9 @@ Options:\n\
      -b, --blocksize SIZE   Use SIZE blocksize in bytes (default 512)\n\
      -s, --size SIZE        Use logical size SIZE\n\
      -w, --writeevery SIZE  Write something every SIZE\n\
+     -d, --descending       Write in descending order\n\
+     -r, --random           Write in random order\n\
+     -i, --initialtruncate  Trunate at the start not the end\n\
      -h, --help             Display usage\n\
 \n\
 Sparsetest tests a file system's handling of sparse files. The destination path is\n\
@@ -110,13 +119,16 @@ parse_command_line (int argc, char **argv)
 	{"blocksize", required_argument, 0, 'b'},
 	{"logicalsize", required_argument, 0, 's'},
 	{"writeevery", required_argument, 0, 'w'},
+	{"initialtruncate", no_argument, 0, 'i'},
+	{"descending", no_argument, 0, 'd'},
+	{"random", no_argument, 0, 'r'},
 	{0, 0, 0, 0}
       };
       /* getopt_long stores the option index here. */
       int option_index = 0;
       int c;
 
-      c = getopt_long (argc, argv, "hb:s:w:", long_options, &option_index);
+      c = getopt_long (argc, argv, "hb:s:w:idr", long_options, &option_index);
 
       /* Detect the end of the options. */
       if (c == -1)
@@ -143,6 +155,18 @@ parse_command_line (int argc, char **argv)
 
 	case 'w':
 	  writeevery_arg = strdup (optarg);
+	  break;
+
+	case 'i':
+	  initialtruncate = 1;
+	  break;
+
+	case 'd':
+	  order = DESCENDING;
+	  break;
+
+	case 'r':
+	  order = RANDOM;
 	  break;
 
 	default:
@@ -196,7 +220,7 @@ parse_command_line (int argc, char **argv)
       exit (1);
     }
 
-  /* Check we have exactly 2 remaining parameters */
+  /* Check we have exactly 1 remaining parameter */
   if ((optind + 1) != argc)
     {
       usage ();
@@ -214,58 +238,112 @@ parse_command_line (int argc, char **argv)
 void
 showlen (const char *label, off_t len)
 {
-  printf ("%23s: %15llu bytes; %15llu M; %15llu blocks (per CLI)\n",
+  printf ("%23s: %15llu bytes; %15llu M; %15llu blocks of %llu bytes\n",
 	  label,
-	  (long long int) len,
-	  (long long int) (len / (1024 * 1024)),
-	  (long long int) (len / blocksize));
+	  (unsigned long long int) len,
+	  (unsigned long long int) (len / (1024 * 1024)),
+	  (unsigned long long int) (len / blocksize),
+	  (unsigned long long int) blocksize);
+}
+
+void
+shuffle (off_t * offsets, long long unsigned int n)
+{
+  long long unsigned int i;
+  if (n <= 1)
+    return;
+
+  for (i = 0; i < n - 1; i++)
+    {
+      long long unsigned int j = i + random () / (RAND_MAX / (n - i) + 1);
+      off_t t = offsets[j];
+      offsets[j] = offsets[i];
+      offsets[i] = t;
+    }
+}
+
+void
+reverse (off_t * offsets, long long unsigned int n)
+{
+  long long unsigned int i;
+  if (n <= 1)
+    return;
+
+  for (i = 0; i < n / 2; i++)
+    {
+      long long unsigned int j = n - 1 - i;
+      off_t t = offsets[j];
+      offsets[j] = offsets[i];
+      offsets[i] = t;
+    }
 }
 
 int
 main (int argc, char **argv)
 {
-  int *junk;
+  int *junk = NULL;
   off_t offset = 0;
+  off_t *offsets = NULL;
   int dest = -1;
   off_t optimumpsize = 0;
   long long unsigned int count = 0;
+  long long unsigned int offnum = 0;
   struct stat sb;
 
   srandom (time (NULL));
 
   dest = parse_command_line (argc, argv);
 
-  if (!(junk = calloc (1, blocksize)))
+  if (!(junk = calloc (1, blocksize))
+      || !(offsets = calloc (sizeof (off_t), logicalsize / writeevery + 2)))
     {
       perror ("calloc()/malloc() failed");
       exit (5);
     }
 
-  if (ftruncate (dest, logicalsize) < 0)
+  if (initialtruncate && ftruncate (dest, logicalsize) < 0)
     {
       perror ("ftruncate() failed");
       exit (6);
     }
 
+
   for (offset = 0; offset + blocksize <= logicalsize; offset += writeevery)
     {
-      int i;
       optimumpsize += blocksize;
-      count++;
+      offsets[count++] = offset;
+    }
+
+  switch (order)
+    {
+    case RANDOM:
+      shuffle (offsets, count);
+      break;
+    case DESCENDING:
+      reverse (offsets, count);
+      break;
+    default:
+      break;
+    }
+
+  for (offnum = 0; offnum < count; offnum++)
+    {
+      int i;
+      offset = offsets[offnum];
       for (i = 0; i < blocksize / sizeof (int); i++)
 	junk[i] = (int) random ();
 
-      if (-1 == lseek (dest, offset, SEEK_SET))
-	{
-	  perror ("lseek(dest) Can't set destination file pointer");
-	  exit (7);
-	}
-
-      if (write (dest, junk, blocksize) < blocksize)
+      if (pwrite (dest, junk, blocksize, offset) < blocksize)
 	{
 	  perror ("write(dest) failed");
 	  exit (9);
 	}
+    }
+
+  if (!initialtruncate && ftruncate (dest, logicalsize) < 0)
+    {
+      perror ("ftruncate() failed");
+      exit (6);
     }
 
   if (-1 == fstat (dest, &sb))
@@ -289,8 +367,8 @@ main (int argc, char **argv)
   showlen ("Intended logical size", logicalsize);
   showlen ("Optimum physical size", optimumpsize);
   showlen ("Actual physical size", finalpsize);
-  printf ("\nUsed %llu writes of %llu bytes every %llu bytes\n", count,
-	  (unsigned long long) blocksize, (unsigned long long) writeevery);
+  printf ("\nUsed %llu writes of %llu bytes every %llu bytes in %s order\n", count,
+	  (unsigned long long) blocksize, (unsigned long long) writeevery, orders[order]);
   printf ("Created %llu 512 byte blocks on disk\n",
 	  (unsigned long long) sb.st_blocks);
   printf ("Density as %% of actual physical size over logical size: %f %%\n",
